@@ -1,0 +1,94 @@
+Multi-Disk VolumeGroupSnapshot Using Azure VM Restore 
+
+Problem
+A Kubernetes VolumeGroupSnapshot must capture multiple Azure Disk PVCs at one common point. Creating individual managed-disk snapshots sequentially does not provide that boundary.
+The proposed mapping is:
+VolumeGroupSnapshot
+└── Azure VM Restore Point
+    ├── Disk Restore Point for PVC 1
+    ├── Disk Restore Point for PVC 2
+     └── Disk Restore Point for PVC 3
+All selected disks must be attached to the same VM.
+Approaches
+Approach	Azure request	Guest coordination	Required Azure consistency result
+1. Crash consistency	Send CrashConsistent	None	CrashConsistent
+2. Filesystem consistency	Omit consistencyMode	VMSnapshot filesystem coordination; no application scripts	FileSystemConsistent or ApplicationConsistent
+3. Application consistency	Omit consistencyMode	VMSnapshot with application pre/post scripts	ApplicationConsistent only
+
+Azure accepts only CrashConsistent as an explicit consistency input. FileSystemConsistent and ApplicationConsistent are results of the guest-coordinated workflow.
+________________________________________
+Approach 1: Crash-Consistent Restore Point
+Azure captures the persisted state of all selected disks at a common point, equivalent to recovering after sudden VM power loss.
+There is no filesystem freeze and no application quiescing.
+
+Workflow:
+1.	Resolve all selected disks and verify they belong to one VM.
+2.	Exclude the OS disk and every unselected data disk.
+3.	Create the Restore Point with: consistencyMode = CrashConsistent
+4.	Return the VM Restore Point ID as the group ID.
+5.	Return each Disk Restore Point ID as a member snapshot ID.
+
+Note: This approach does not freeze the filesystem before creating the Restore Point. Therefore, it provides crash consistency only and must not be considered filesystem-consistent.________________________________________
+Approach 2: Without pre/post snapshot script 
+(Recommended as of now we only care for filesystem consistency)
+
+Azure VMSnapshot coordinates with the VM to flush pending filesystem writes, temporarily freeze the filesystems, create the Restore Point, and then unfreeze the filesystems.
+
+This approach does not configure application-specific pre/post scripts:
+•	A pre-script would normally prepare an application for the snapshot—for example, by creating a database checkpoint, flushing database buffers, and pausing new transactions.
+•	A post-script would return the application to its normal state—for example, by releasing locks, exiting backup mode, and resuming transactions.
+
+Azure also coordinates with the application before and after the multi-disk capture:
+•	On Linux, VMSnapshotLinux runs workload-specific pre/post scripts.
+•	On Windows, VMSnapshot invokes application-specific VSS writers.
+
+Without these scripts, Azure can make the filesystems recoverable, but it does not understand the internal state of the applications using them.
+Therefore, this approach provides filesystem consistency, but it does not guarantee database or application transaction consistency.
+
+Workflow
+1.	Resolve all selected disks and verify they belong to one VM.
+2.	Create the Restore Point with consistencyMode omitted: consistencyMode = omitted
+3.	Azure installs or invokes VMSnapshotLinux/ VMSnapshot.
+4.	Accept the result when Azure returns: FileSystemConsistent , ApplicationConsistent is also acceptable because it is stronger than the requested contract.
+5.	Reject CrashConsistent.
+
+Note: This mode provides filesystem consistency or a higher consistency level. Because Azure does not support explicitly requesting FileSystemConsistent, the driver omits consistencyMode from the request and validates the consistency level returned by Azure. The operation succeeds if Azure returns FileSystemConsistent or ApplicationConsistent; it fails if Azure returns CrashConsistent.
+________________________________________
+Approach 3: With pre/post snapshot script
+
+Filesystem consistency ensures that the filesystem can be restored without corruption, but it does not understand the application’s internal state. For example, a database may still have completed transactions or related updates held in memory when the snapshot is taken. As a result, the restored filesystem may be healthy while the database still requires recovery or contains incomplete application data.
+To achieve application consistency, the workload owner provides a pre-snapshot script and a post-snapshot script:
+•	The pre-snapshot script uses the application’s supported commands to create a checkpoint, flush in-memory data, and temporarily pause new writes.
+•	The post-snapshot script releases any locks or backup mode and resumes normal application writes.
+
+Azure VMSnapshot runs workload-specific Linux pre/post scripts around the multi-disk capture.The pre-script flushes and pauses the application. The post-script resumes it. The CSI driver requests the Restore Point and validates that Azure returns ApplicationConsistent.
+
+Workflow
+1.	The customer or platform owner installs:
+/etc/azure/VMSnapshotScriptPluginConfig.json
+pre-script
+post-script
+
+2.	Configure strict behavior:
+{
+  "continueBackupOnFailure": false,
+  "fsFreezeEnabled": true
+}
+3.	Resolve all selected disks and verify they belong to one VM.
+4.	Create the Restore Point with consistencyMode omitted: consistencyMode = omitted
+5.	Azure installs or invokes VMSnapshotLinux/ VMSnapshot.
+6.	Azure performs:
+    -> run pre-script
+    -> freeze filesystems
+    -> capture selected disks
+    -> thaw filesystems
+    -> run post-script
+7.	Accept only: ApplicationConsistent , reject FileSystemConsistent, CrashConsistent, or an empty result.
+
+The CSI driver does not run a second fsfreeze. Azure VMSnapshot owns the quiesce, capture, and resume sequence.
+
+Note: Use this approach as the strict application-consistency contract. The snapshot is considered successful only when Azure confirms that application consistency was achieved by returning ApplicationConsistent. If Azure returns FileSystemConsistent, CrashConsistent, or no consistency mode, the driver fails the request rather than publishing it as application-consistent.
+References
+•	https://learn.microsoft.com/en-us/azure/virtual-machines/concepts-restore-points
+•	https://learn.microsoft.com/en-us/azure/virtual-machines/virtual-machines-restore-points-vm-snapshot-extension
+
